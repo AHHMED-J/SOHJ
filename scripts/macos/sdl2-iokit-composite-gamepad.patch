@@ -1,0 +1,150 @@
+diff --git a/src/joystick/darwin/SDL_iokitjoystick.c b/src/joystick/darwin/SDL_iokitjoystick.c
+index 8bb8d00..dc6042f 100644
+--- a/src/joystick/darwin/SDL_iokitjoystick.c
++++ b/src/joystick/darwin/SDL_iokitjoystick.c
+@@ -245,6 +245,7 @@ static void JoystickDeviceWasRemovedCallback(void *ctx, IOReturn result, void *s
+ }
+ 
+ static void AddHIDElement(const void *value, void *parameter);
++static SDL_bool ElementInGamepadCollection(IOHIDElementRef element);
+ 
+ /* Call AddHIDElement() on all elements in an array of IOHIDElementRefs */
+ static void AddHIDElements(CFArrayRef array, recDevice *pDevice)
+@@ -271,7 +272,8 @@ static void AddHIDElement(const void *value, void *parameter)
+     IOHIDElementRef refElement = (IOHIDElementRef)value;
+     const CFTypeID elementTypeID = refElement ? CFGetTypeID(refElement) : 0;
+ 
+-    if (refElement && (elementTypeID == IOHIDElementGetTypeID())) {
++    if (refElement && (elementTypeID == IOHIDElementGetTypeID()) &&
++        (!pDevice->gamepadCollectionOnly || ElementInGamepadCollection(refElement))) {
+         const IOHIDElementCookie cookie = IOHIDElementGetCookie(refElement);
+         const uint32_t usagePage = IOHIDElementGetUsagePage(refElement);
+         const uint32_t usage = IOHIDElementGetUsage(refElement);
+@@ -420,6 +422,60 @@ static int GetSteamVirtualGamepadSlot(Uint16 vendor_id, Uint16 product_id, const
+     return slot;
+ }
+ 
++static SDL_bool IsGamepadUsage(uint32_t usagePage, uint32_t usage)
++{
++    return usagePage == kHIDPage_GenericDesktop &&
++           (usage == kHIDUsage_GD_Joystick ||
++            usage == kHIDUsage_GD_GamePad ||
++            usage == kHIDUsage_GD_MultiAxisController);
++}
++
++/* Composite devices (e.g. GameSir G7 Pro over Bluetooth) report a consumer-control primary usage
++   but still contain a gamepad application collection. Find it in the device usage pairs. */
++static SDL_bool HasGamepadUsagePair(IOHIDDeviceRef hidDevice, uint32_t *usagePage, uint32_t *usage)
++{
++    CFArrayRef pairs = (CFArrayRef)IOHIDDeviceGetProperty(hidDevice, CFSTR(kIOHIDDeviceUsagePairsKey));
++    CFIndex i;
++
++    if (!pairs || CFGetTypeID(pairs) != CFArrayGetTypeID()) {
++        return SDL_FALSE;
++    }
++    for (i = 0; i < CFArrayGetCount(pairs); i++) {
++        CFDictionaryRef pair = (CFDictionaryRef)CFArrayGetValueAtIndex(pairs, i);
++        CFNumberRef pageRef, usageRef;
++        uint32_t pairPage = 0, pairUsage = 0;
++
++        if (!pair || CFGetTypeID(pair) != CFDictionaryGetTypeID()) {
++            continue;
++        }
++        pageRef = (CFNumberRef)CFDictionaryGetValue(pair, CFSTR(kIOHIDDeviceUsagePageKey));
++        usageRef = (CFNumberRef)CFDictionaryGetValue(pair, CFSTR(kIOHIDDeviceUsageKey));
++        if (!pageRef || !usageRef) {
++            continue;
++        }
++        CFNumberGetValue(pageRef, kCFNumberSInt32Type, &pairPage);
++        CFNumberGetValue(usageRef, kCFNumberSInt32Type, &pairUsage);
++        if (IsGamepadUsage(pairPage, pairUsage)) {
++            *usagePage = pairPage;
++            *usage = pairUsage;
++            return SDL_TRUE;
++        }
++    }
++    return SDL_FALSE;
++}
++
++static SDL_bool ElementInGamepadCollection(IOHIDElementRef element)
++{
++    while (element) {
++        if (IOHIDElementGetType(element) == kIOHIDElementTypeCollection &&
++            IOHIDElementGetCollectionType(element) == kIOHIDElementCollectionTypeApplication) {
++            return IsGamepadUsage(IOHIDElementGetUsagePage(element), IOHIDElementGetUsage(element));
++        }
++        element = IOHIDElementGetParent(element);
++    }
++    return SDL_FALSE;
++}
++
+ static SDL_bool GetDeviceInfo(IOHIDDeviceRef hidDevice, recDevice *pDevice)
+ {
+     Sint32 vendor = 0;
+@@ -436,19 +492,16 @@ static SDL_bool GetDeviceInfo(IOHIDDeviceRef hidDevice, recDevice *pDevice)
+     if (refCF) {
+         CFNumberGetValue(refCF, kCFNumberSInt32Type, &pDevice->usagePage);
+     }
+-    if (pDevice->usagePage != kHIDPage_GenericDesktop) {
+-        return SDL_FALSE; /* Filter device list to non-keyboard/mouse stuff */
+-    }
+-
+     refCF = IOHIDDeviceGetProperty(hidDevice, CFSTR(kIOHIDPrimaryUsageKey));
+     if (refCF) {
+         CFNumberGetValue(refCF, kCFNumberSInt32Type, &pDevice->usage);
+     }
+ 
+-    if ((pDevice->usage != kHIDUsage_GD_Joystick &&
+-         pDevice->usage != kHIDUsage_GD_GamePad &&
+-         pDevice->usage != kHIDUsage_GD_MultiAxisController)) {
+-        return SDL_FALSE; /* Filter device list to non-keyboard/mouse stuff */
++    if (!IsGamepadUsage(pDevice->usagePage, pDevice->usage)) {
++        if (!HasGamepadUsagePair(hidDevice, &pDevice->usagePage, &pDevice->usage)) {
++            return SDL_FALSE; /* Filter device list to non-keyboard/mouse stuff */
++        }
++        pDevice->gamepadCollectionOnly = SDL_TRUE;
+     }
+ 
+     /* Make sure we retain the use of the IOKit-provided device-object,
+@@ -516,13 +569,28 @@ static SDL_bool GetDeviceInfo(IOHIDDeviceRef hidDevice, recDevice *pDevice)
+     return SDL_TRUE;
+ }
+ 
++static SDL_bool HasGamepadPrimaryUsage(IOHIDDeviceRef hidDevice)
++{
++    uint32_t usagePage = 0, usage = 0;
++    CFTypeRef refCF = IOHIDDeviceGetProperty(hidDevice, CFSTR(kIOHIDPrimaryUsagePageKey));
++    if (refCF) {
++        CFNumberGetValue(refCF, kCFNumberSInt32Type, &usagePage);
++    }
++    refCF = IOHIDDeviceGetProperty(hidDevice, CFSTR(kIOHIDPrimaryUsageKey));
++    if (refCF) {
++        CFNumberGetValue(refCF, kCFNumberSInt32Type, &usage);
++    }
++    return IsGamepadUsage(usagePage, usage);
++}
++
+ static SDL_bool JoystickAlreadyKnown(IOHIDDeviceRef ioHIDDeviceObject)
+ {
+     recDevice *i;
+ 
+ #if defined(SDL_JOYSTICK_MFI)
+     extern SDL_bool IOS_SupportedHIDDevice(IOHIDDeviceRef device);
+-    if (IOS_SupportedHIDDevice(ioHIDDeviceObject)) {
++    /* GameController.framework claims composite devices as a keyboard/mouse without exposing a GCController */
++    if (HasGamepadPrimaryUsage(ioHIDDeviceObject) && IOS_SupportedHIDDevice(ioHIDDeviceObject)) {
+         return SDL_TRUE;
+     }
+ #endif
+diff --git a/src/joystick/darwin/SDL_iokitjoystick_c.h b/src/joystick/darwin/SDL_iokitjoystick_c.h
+index e7b42ae..fcf478d 100644
+--- a/src/joystick/darwin/SDL_iokitjoystick_c.h
++++ b/src/joystick/darwin/SDL_iokitjoystick_c.h
+@@ -55,6 +55,7 @@ struct joystick_hwdata
+     char product[256];  /* name of product */
+     uint32_t usage;     /* usage page from IOUSBHID Parser.h which defines general usage */
+     uint32_t usagePage; /* usage within above page from IOUSBHID Parser.h which defines specific usage */
++    SDL_bool gamepadCollectionOnly; /* composite device: only read elements inside its gamepad collection */
+ 
+     int axes;     /* number of axis (calculated, not reported by device) */
+     int buttons;  /* number of buttons (calculated, not reported by device) */
